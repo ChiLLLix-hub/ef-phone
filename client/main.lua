@@ -177,6 +177,7 @@ local function LoadPhone()
     QBCore.Functions.TriggerCallback('qb-phone:server:GetPhoneData', function(pData)
         PlayerJob = QBCore.Functions.GetPlayerData().job
         PhoneData.PlayerData = QBCore.Functions.GetPlayerData()
+        PhoneData.PlayerData.iban = pData.PlayerIban
         local PhoneMeta = PhoneData.PlayerData.metadata['phone']
         PhoneData.MetaData = PhoneMeta
 
@@ -1209,7 +1210,7 @@ RegisterNUICallback('CanTransferMoney', function(data, cb)
             if Transferd then
                 cb({ TransferedMoney = true, NewBalance = (PlayerData.money.bank - amount) })
             else
-                SendNUIMessage({ action = 'PhoneNotification', PhoneNotify = { timeout = 3000, title = 'Bank', text = 'Account does not exist!', icon = 'fas fa-university', color = '#ff0000', }, })
+                SendNUIMessage({ action = 'PhoneNotification', PhoneNotify = { timeout = 3000, title = 'Bank', text = 'Transfer failed. Check IBAN and balance.', icon = 'fas fa-university', color = '#ff0000', }, })
                 cb({ TransferedMoney = false })
             end
         end, amount, iban)
@@ -1489,7 +1490,7 @@ end)
 
 RegisterNetEvent('qb-phone:client:TransferMoney', function(amount, newmoney)
     PhoneData.PlayerData.money.bank = newmoney
-    SendNUIMessage({ action = 'PhoneNotification', PhoneNotify = { title = 'QBank', text = '&#36;' .. amount .. ' has been added to your account!', icon = 'fas fa-university', color = '#8c7ae6', }, })
+    SendNUIMessage({ action = 'PhoneNotification', PhoneNotify = { title = 'Bank', text = '&#36;' .. amount .. ' has been added to your account!', icon = 'fas fa-university', color = '#8c7ae6', }, })
     SendNUIMessage({ action = 'UpdateBank', NewBalance = PhoneData.PlayerData.money.bank })
 end)
 
