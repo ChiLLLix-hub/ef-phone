@@ -40,6 +40,103 @@ local function round(num, numDecimalPlaces)
     return math.floor(num + 0.5)
 end
 
+local function sanitizeTransferFields(amount, iban)
+    local newAmount = tostring(amount or '')
+    local newIban = tostring(iban or '')
+
+    for _, v in pairs(bannedCharacters) do
+        newAmount = string.gsub(newAmount, '%' .. v, '')
+        newIban = string.gsub(newIban, '%' .. v, '')
+    end
+
+    local cleanAmount = tonumber(newAmount)
+    local cleanIban = newIban:gsub('%s+', ''):upper()
+    return cleanAmount, cleanIban
+end
+
+local function getSocietyKeyAndName(rawSociety)
+    local societyName = tostring(rawSociety or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if societyName == '' then
+        return nil, nil
+    end
+
+    local societyKey = societyName
+    if not societyKey:find('^society_') then
+        societyKey = 'society_' .. societyKey
+    else
+        societyName = societyName:gsub('^society_', '')
+    end
+
+    return societyKey, societyName
+end
+
+local function ensureUniqueIban(base)
+    local candidate = base
+    while true do
+        local usedByPlayer = MySQL.query.await('SELECT citizenid FROM players WHERE UPPER(iban) = ? LIMIT 1', { candidate })
+        local usedBySociety = MySQL.query.await('SELECT society FROM okokBanking_societies WHERE UPPER(iban) = ? LIMIT 1', { candidate })
+        if not usedByPlayer[1] and not usedBySociety[1] then
+            return candidate
+        end
+
+        candidate = string.format('%s%d', base, math.random(100, 999))
+    end
+end
+
+local function ensureSocietyAccount(rawSociety)
+    local societyKey, societyName = getSocietyKeyAndName(rawSociety)
+    if not societyKey or not societyName then return nil end
+
+    local existing = MySQL.query.await('SELECT * FROM okokBanking_societies WHERE society = ? OR society_name = ? LIMIT 1', {
+        societyKey,
+        societyName,
+    })
+
+    if existing[1] then
+        return existing[1]
+    end
+
+    local ibanSeed = ('OK%s'):format(societyName:gsub('%s+', ''):gsub('[^%w]', ''):upper())
+    if ibanSeed == 'OK' then
+        ibanSeed = 'OKSOCIETY'
+    end
+    local societyIban = ensureUniqueIban(ibanSeed)
+
+    MySQL.query.await('INSERT INTO okokBanking_societies (society, society_name, value, iban) VALUES (?, ?, ?, ?)', {
+        societyKey,
+        societyName,
+        0,
+        societyIban,
+    })
+
+    local created = MySQL.query.await('SELECT * FROM okokBanking_societies WHERE society = ? LIMIT 1', { societyKey })
+    return created[1]
+end
+
+local function resolveTransferTarget(senderCitizenId, iban)
+    local playerRows = MySQL.query.await('SELECT * FROM players WHERE UPPER(iban) = ? LIMIT 1', { iban })
+    if playerRows[1] then
+        if playerRows[1].citizenid == senderCitizenId then
+            return { blockedSelf = true }
+        end
+
+        return {
+            type = 'player',
+            data = playerRows[1],
+        }
+    end
+
+    local societyRows = MySQL.query.await('SELECT * FROM okokBanking_societies WHERE UPPER(iban) = ? LIMIT 1', { iban })
+    if societyRows[1] then
+        return {
+            type = 'society',
+            data = societyRows[1],
+        }
+    end
+
+    return nil
+end
+
 function QBPhone.AddMentionedTweet(citizenid, TweetData)
     if MentionedTweets[citizenid] == nil then
         MentionedTweets[citizenid] = {}
@@ -196,9 +293,11 @@ QBCore.Functions.CreateCallback('qb-phone:server:GetPhoneData', function(source,
             CryptoTransactions = {},
             Tweets = {},
             Images = {},
-            InstalledApps = Player.PlayerData.metadata['phonedata'].InstalledApps
+            InstalledApps = Player.PlayerData.metadata['phonedata'].InstalledApps,
+            PlayerIban = nil,
         }
         PhoneData.Adverts = Adverts
+        PhoneData.PlayerIban = MySQL.scalar.await('SELECT iban FROM players WHERE citizenid = ?', { Player.PlayerData.citizenid })
 
         local result = MySQL.query.await('SELECT * FROM player_contacts WHERE citizenid = ? ORDER BY name ASC', { Player.PlayerData.citizenid })
         if result[1] ~= nil then
@@ -287,6 +386,21 @@ end)
 QBCore.Functions.CreateCallback('qb-phone:server:PayInvoice', function(source, cb, society, amount, invoiceId, sendercitizenid)
     local Invoices = {}
     local Ply = QBCore.Functions.GetPlayer(source)
+    amount = tonumber(amount)
+    if not Ply then
+        cb(false, Invoices)
+        return
+    end
+
+    if not amount or amount <= 0 or Ply.PlayerData.money.bank < amount then
+        local invoices = MySQL.query.await('SELECT * FROM phone_invoices WHERE citizenid = ?', { Ply.PlayerData.citizenid })
+        if invoices[1] ~= nil then
+            Invoices = invoices
+        end
+        cb(false, Invoices)
+        return
+    end
+
     local SenderPly = QBCore.Functions.GetPlayerByCitizenId(sendercitizenid)
     local invoiceMailData = {}
     if SenderPly and Config.BillingCommissions[society] then
@@ -304,9 +418,28 @@ QBCore.Functions.CreateCallback('qb-phone:server:PayInvoice', function(source, c
             message = string.format('%s %s paid a bill of $%s', Ply.PlayerData.charinfo.firstname, Ply.PlayerData.charinfo.lastname, amount)
         }
     end
+
+    local societyAccount = ensureSocietyAccount(society)
+    if not societyAccount then
+        local invoices = MySQL.query.await('SELECT * FROM phone_invoices WHERE citizenid = ?', { Ply.PlayerData.citizenid })
+        if invoices[1] ~= nil then
+            Invoices = invoices
+        end
+        cb(false, Invoices)
+        return
+    end
+
     Ply.Functions.RemoveMoney('bank', amount, 'paid-invoice')
-    exports['ef-phone']:sendNewMailToOffline(sendercitizenid, invoiceMailData)
-    exports['qb-banking']:AddMoney(society, amount, 'Phone invoice')
+    if sendercitizenid then
+        exports['ef-phone']:sendNewMailToOffline(sendercitizenid, invoiceMailData)
+    end
+
+    MySQL.update('UPDATE okokBanking_societies SET value = value + ? WHERE society = ?', {
+        amount,
+        societyAccount.society,
+    })
+    TriggerEvent('okokBanking:AddTransferTransactionToSociety', amount, source, societyAccount.society, societyAccount.society_name)
+
     MySQL.query('DELETE FROM phone_invoices WHERE id = ?', { invoiceId })
     local invoices = MySQL.query.await('SELECT * FROM phone_invoices WHERE citizenid = ?', { Ply.PlayerData.citizenid })
     if invoices[1] ~= nil then
@@ -533,34 +666,24 @@ QBCore.Functions.CreateCallback('qb-phone:server:HasPhone', function(source, cb)
 end)
 
 QBCore.Functions.CreateCallback('qb-phone:server:CanTransferMoney', function(source, cb, amount, iban)
-    -- strip bad characters from bank transfers
-    local newAmount = tostring(amount)
-    local newiban = tostring(iban)
-    for _, v in pairs(bannedCharacters) do
-        newAmount = string.gsub(newAmount, '%' .. v, '')
-        newiban = string.gsub(newiban, '%' .. v, '')
-    end
-    iban = newiban
-    amount = tonumber(newAmount)
+    amount, iban = sanitizeTransferFields(amount, iban)
 
     local Player = QBCore.Functions.GetPlayer(source)
-    if (Player.PlayerData.money.bank - amount) >= 0 then
-        local query = '%"account":"' .. iban .. '"%'
-        local result = MySQL.query.await('SELECT * FROM players WHERE charinfo LIKE ?', { query })
-        if result[1] ~= nil then
-            local Reciever = QBCore.Functions.GetPlayerByCitizenId(result[1].citizenid)
-            Player.Functions.RemoveMoney('bank', amount)
-            if Reciever ~= nil then
-                Reciever.Functions.AddMoney('bank', amount)
-            else
-                local RecieverMoney = json.decode(result[1].money)
-                RecieverMoney.bank = (RecieverMoney.bank + amount)
-                MySQL.update('UPDATE players SET money = ? WHERE citizenid = ?', { json.encode(RecieverMoney), result[1].citizenid })
-            end
-            cb(true)
-        else
-            cb(false)
-        end
+    if not Player or not amount or amount <= 0 or not iban or iban == '' then
+        cb(false)
+        return
+    end
+
+    if (Player.PlayerData.money.bank - amount) < 0 then
+        cb(false)
+        return
+    end
+
+    local target = resolveTransferTarget(Player.PlayerData.citizenid, iban)
+    if target and not target.blockedSelf then
+        cb(true)
+    else
+        cb(false)
     end
 end)
 
@@ -828,30 +951,70 @@ end)
 RegisterNetEvent('qb-phone:server:TransferMoney', function(iban, amount)
     local src = source
     local sender = QBCore.Functions.GetPlayer(src)
+    if not sender then return end
 
-    local query = '%' .. iban .. '%'
-    local result = MySQL.query.await('SELECT * FROM players WHERE charinfo LIKE ?', { query })
-    if result[1] ~= nil then
-        local reciever = QBCore.Functions.GetPlayerByCitizenId(result[1].citizenid)
+    amount, iban = sanitizeTransferFields(amount, iban)
+
+    if not amount or amount <= 0 or not iban or iban == '' then
+        TriggerClientEvent('QBCore:Notify', src, 'Invalid amount', 'error')
+        return
+    end
+
+    if sender.PlayerData.money.bank < amount then
+        TriggerClientEvent('QBCore:Notify', src, "You don't have enough money", 'error')
+        return
+    end
+
+    local target = resolveTransferTarget(sender.PlayerData.citizenid, iban)
+    if not target then
+        TriggerClientEvent('QBCore:Notify', src, 'This IBAN does not exist!', 'error')
+        return
+    end
+
+    if target.blockedSelf then
+        TriggerClientEvent('QBCore:Notify', src, "You can't send money to yourself", 'error')
+        return
+    end
+
+    if target.type == 'player' then
+        local recieverData = target.data
+        local reciever = QBCore.Functions.GetPlayerByCitizenId(recieverData.citizenid)
 
         if reciever ~= nil then
             local PhoneItem = reciever.Functions.GetItemByName('phone')
             reciever.Functions.AddMoney('bank', amount, 'phone-transfered-from-' .. sender.PlayerData.citizenid)
             sender.Functions.RemoveMoney('bank', amount, 'phone-transfered-to-' .. reciever.PlayerData.citizenid)
+            TriggerEvent('okokBanking:AddTransferTransaction', amount, reciever, src)
 
             if PhoneItem ~= nil then
                 TriggerClientEvent('qb-phone:client:TransferMoney', reciever.PlayerData.source, amount,
                     reciever.PlayerData.money.bank)
             end
         else
-            local moneyInfo = json.decode(result[1].money)
+            local moneyInfo = json.decode(recieverData.money)
             moneyInfo.bank = round((moneyInfo.bank + amount))
             MySQL.update('UPDATE players SET money = ? WHERE citizenid = ?',
-                { json.encode(moneyInfo), result[1].citizenid })
+                { json.encode(moneyInfo), recieverData.citizenid })
             sender.Functions.RemoveMoney('bank', amount, 'phone-transfered')
+
+            local receiverName = recieverData.citizenid
+            if recieverData.charinfo then
+                local decoded = json.decode(recieverData.charinfo)
+                if decoded and decoded.firstname and decoded.lastname then
+                    receiverName = string.format('%s %s', decoded.firstname, decoded.lastname)
+                end
+            end
+            TriggerEvent('okokBanking:AddTransferTransaction', amount, 1, src, receiverName, recieverData.citizenid)
         end
+    elseif target.type == 'society' then
+        sender.Functions.RemoveMoney('bank', amount, 'phone-transfered-to-' .. target.data.society)
+        MySQL.update('UPDATE okokBanking_societies SET value = value + ? WHERE society = ?', {
+            amount,
+            target.data.society,
+        })
+        TriggerEvent('okokBanking:AddTransferTransactionToSociety', amount, src, target.data.society, target.data.society_name)
     else
-        TriggerClientEvent('QBCore:Notify', src, "This account number doesn't exist!", 'error')
+        TriggerClientEvent('QBCore:Notify', src, 'This IBAN does not exist!', 'error')
     end
 end)
 
@@ -964,13 +1127,19 @@ end)
 RegisterNetEvent('qb-phone:server:GiveContactDetails', function(PlayerId)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
+    local bankAccount = ''
+    local result = MySQL.query.await('SELECT iban FROM players WHERE citizenid = ?', { Player.PlayerData.citizenid })
+    if result[1] ~= nil and result[1].iban ~= nil then
+        bankAccount = result[1].iban
+    end
+
     local SuggestionData = {
         name = {
             [1] = Player.PlayerData.charinfo.firstname,
             [2] = Player.PlayerData.charinfo.lastname
         },
         number = Player.PlayerData.charinfo.phone,
-        bank = Player.PlayerData.charinfo.account
+        bank = bankAccount
     }
 
     TriggerClientEvent('qb-phone:client:AddNewSuggestion', PlayerId, SuggestionData)
